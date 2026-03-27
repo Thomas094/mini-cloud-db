@@ -1,0 +1,20 @@
+# 编译产物
+build/
+cmake-build-*/
+
+# 编辑器/IDE 缓存
+.cache/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 编译中间文件
+*.o
+*.a
+*.so
+*.dylib
+
+# 测试临时文件
+/tmp/test_minidb*.db
