@@ -4,6 +4,8 @@
 #include "common/config.h"
 #include <cstring>
 #include <atomic>
+#include <shared_mutex>
+#include <condition_variable>
 
 namespace minidb {
 
@@ -38,9 +40,9 @@ public:
     inline char* GetData() { return data_; }
     inline const char* GetData() const { return data_; }
 
-    // 页面ID
-    inline page_id_t GetPageId() const { return page_id_; }
-    inline void SetPageId(page_id_t page_id) { page_id_ = page_id; }
+    // 页面ID（原子变量，允许上层无锁安全读取）
+    inline page_id_t GetPageId() const { return page_id_.load(); }
+    inline void SetPageId(page_id_t page_id) { page_id_.store(page_id); }
 
     // LSN —— 这个页面最后一次被修改时的WAL日志位置
     // 恢复时：if (page_lsn < wal_record_lsn) → 需要redo
@@ -57,21 +59,58 @@ public:
     inline bool IsDirty() const { return is_dirty_; }
     inline void SetDirty(bool dirty) { is_dirty_ = dirty; }
 
+    // ============================================================
+    // 页面级读写锁
+    // ============================================================
+    // 读锁（共享）：多个线程可以同时读取页面数据
+    //   使用场景：FetchPage 返回后，上层读取 data_
+    inline void RLock() { page_latch_.lock_shared(); }
+    inline void RUnlock() { page_latch_.unlock_shared(); }
+
+    // 写锁（独占）：只有一个线程可以修改页面数据
+    //   使用场景：FlushPage 写回磁盘、FetchPage 淘汰旧页面并加载新数据
+    inline void WLock() { page_latch_.lock(); }
+    inline void WUnlock() { page_latch_.unlock(); }
+    std::shared_mutex& GetPageLatch() { return page_latch_; }
+
+    // ============================================================
+    // Loading 状态（类似 PostgreSQL 的 BM_IO_IN_PROGRESS）
+    // ============================================================
+    // 当一个帧正在从磁盘加载数据时，标记为 loading 状态。
+    // 其他线程通过 page_table_ 命中该帧后，需要等待 loading 完成，
+    // 避免读到不完整/旧的数据。
+    inline bool IsLoading() const { return is_loading_; }
+    inline void SetLoading(bool loading) { is_loading_ = loading; }
+
+    // 通知所有等待 loading 完成的线程（调用者需持有 BPM latch_）
+    inline void NotifyReady() { loading_cv_.notify_all(); }
+
+    // 等待 loading 完成（调用者需持有 BPM latch_ 的 unique_lock）
+    // condition_variable_any::wait 会自动释放 BPM latch_，
+    // 让其他线程可以继续操作，被唤醒后重新获取锁。
+    void WaitUntilReady(std::unique_lock<std::mutex>& bpm_latch) {
+        loading_cv_.wait(bpm_latch, [this]() { return !is_loading_; });
+    }
+
     // 重置页面
     void Reset() {
         std::memset(data_, 0, PAGE_SIZE);
-        page_id_ = INVALID_PAGE_ID;
+        page_id_.store(INVALID_PAGE_ID);
         lsn_ = INVALID_LSN;
         pin_count_.store(0);
         is_dirty_ = false;
+        is_loading_ = false;
     }
 
 private:
     char data_[PAGE_SIZE]{};           // 页面数据（固定8KB）
-    page_id_t page_id_{INVALID_PAGE_ID};
+    std::atomic<page_id_t> page_id_{INVALID_PAGE_ID};
     lsn_t lsn_{INVALID_LSN};
     std::atomic<int> pin_count_{0};
     bool is_dirty_{false};
+    bool is_loading_{false};           // 是否正在加载中（类似 PG 的 BM_IO_IN_PROGRESS）
+    std::shared_mutex page_latch_;     // 页面级读写锁
+    std::condition_variable_any loading_cv_;  // loading 完成的通知
 };
 
 } // namespace minidb
