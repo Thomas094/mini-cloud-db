@@ -286,6 +286,81 @@ bool TestWALManager() {
             bpm.UnpinPage(0, false);
         }
 
+        // 清理，测试 Truncate
+        unlink(wal_file.c_str());
+        unlink(db_file.c_str());
+
+        // ---- 测试5：Truncate 截断已提交事务的日志 ----
+        {
+            WALManager wal(wal_file);
+
+            // 事务3：写入数据并提交
+            LogRecord begin3 = LogRecord::MakeTxnRecord(
+                LogRecordType::TXN_BEGIN, /*txn_id=*/3, INVALID_LSN);
+            lsn_t lsn1 = wal.AppendLog(begin3);
+
+            const char* data3 = "TruncTest";
+            LogRecord insert3 = LogRecord::MakeDataRecord(
+                LogRecordType::INSERT, /*txn_id=*/3, /*prev_lsn=*/lsn1,
+                /*page_id=*/0, /*offset=*/0,
+                /*old_data=*/nullptr, /*old_len=*/0,
+                /*new_data=*/data3, /*new_len=*/9);
+            lsn_t lsn2 = wal.AppendLog(insert3);
+
+            LogRecord commit3 = LogRecord::MakeTxnRecord(
+                LogRecordType::TXN_COMMIT, /*txn_id=*/3, /*prev_lsn=*/lsn2);
+            lsn_t lsn3 = wal.AppendLog(commit3);
+
+            // 事务4：写入数据并提交（在 truncate 点之后）
+            LogRecord begin4 = LogRecord::MakeTxnRecord(
+                LogRecordType::TXN_BEGIN, /*txn_id=*/4, INVALID_LSN);
+            lsn_t lsn4 = wal.AppendLog(begin4);
+
+            const char* data4 = "AfterTrunc";
+            LogRecord insert4 = LogRecord::MakeDataRecord(
+                LogRecordType::INSERT, /*txn_id=*/4, /*prev_lsn=*/lsn4,
+                /*page_id=*/1, /*offset=*/0,
+                /*old_data=*/nullptr, /*old_len=*/0,
+                /*new_data=*/data4, /*new_len=*/10);
+            lsn_t lsn5 = wal.AppendLog(insert4);
+
+            LogRecord commit4 = LogRecord::MakeTxnRecord(
+                LogRecordType::TXN_COMMIT, /*txn_id=*/4, /*prev_lsn=*/lsn5);
+            wal.AppendLog(commit4);
+
+            wal.Flush();
+
+            // 以 lsn3 为 checkpoint 点截断（事务3的日志应被删除）
+            wal.Truncate(lsn3);
+
+            // 验证：用新的 BPM Recover，只有事务4的数据被 Redo
+            auto dm = std::make_unique<DiskManager>(db_file);
+            BufferPoolManager bpm(10, dm.get());
+
+            page_id_t pid0, pid1;
+            Page* p0 = bpm.NewPage(&pid0);  // page 0
+            Page* p1 = bpm.NewPage(&pid1);  // page 1
+            EXPECT_TRUE(p0 != nullptr);
+            EXPECT_TRUE(p1 != nullptr);
+            bpm.UnpinPage(pid0, false);
+            bpm.UnpinPage(pid1, false);
+
+            wal.Recover(&bpm);
+
+            // page 0 应该是空的（事务3的日志已被截断）
+            Page* rp0 = bpm.FetchPage(0);
+            EXPECT_TRUE(rp0 != nullptr);
+            char zeros[9] = {0};
+            EXPECT_TRUE(std::memcmp(rp0->GetUserData(), zeros, 9) == 0);
+            bpm.UnpinPage(0, false);
+
+            // page 1 应该有事务4的数据（截断点之后的日志保留）
+            Page* rp1 = bpm.FetchPage(1);
+            EXPECT_TRUE(rp1 != nullptr);
+            EXPECT_TRUE(std::memcmp(rp1->GetUserData(), "AfterTrunc", 10) == 0);
+            bpm.UnpinPage(1, false);
+        }
+
         // 清理临时文件
         unlink(wal_file.c_str());
         unlink(db_file.c_str());

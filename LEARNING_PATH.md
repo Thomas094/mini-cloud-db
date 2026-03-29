@@ -694,10 +694,10 @@ assert(done);
 
 | 阶段 | 模块 | TODO数 | 面试重要度 | 状态 |
 |------|------|--------|-----------|------|
-| 1 | DiskManager | 3 | ⭐⭐ | ☐ |
-| 2 | LRU Replacer | 4 | ⭐⭐⭐⭐ | ☐ |
-| 3 | Buffer Pool Manager | 5 | ⭐⭐⭐⭐⭐ | ☐ |
-| 4 | WAL Manager | 3 | ⭐⭐⭐⭐⭐ | ☐ |
+| 1 | DiskManager | 3 | ⭐⭐ | ✅ 已完成 |
+| 2 | LRU Replacer | 4 | ⭐⭐⭐⭐ | ✅ 已完成 |
+| 3 | Buffer Pool Manager | 5 | ⭐⭐⭐⭐⭐ | ✅ 已完成 |
+| 4 | WAL Manager | 3 | ⭐⭐⭐⭐⭐ | ✅ 已完成 |
 | 5 | MVCC | 5 | ⭐⭐⭐⭐⭐ | ☐ |
 | 6 | B+Tree | 5 | ⭐⭐⭐⭐ | ☐ |
 | 7 | PageServer（存储计算分离） | 5 | ⭐⭐⭐⭐⭐ | ☐ |
@@ -706,7 +706,7 @@ assert(done);
 | 10 | TenantManager（多租户） | 7 | ⭐⭐⭐ | ☐ |
 | 11 | Distributed Txn（2PC） | 4 | ⭐⭐⭐⭐ | ☐ |
 | 12 | IoUringEngine | 5 | ⭐⭐⭐ | ☐ |
-| **合计** | **12 个模块** | **55** | | |
+| **合计** | **12 个模块** | **55** | | **已完成 4/12** |
 
 ---
 

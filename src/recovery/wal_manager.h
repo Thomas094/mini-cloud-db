@@ -6,6 +6,7 @@
 #include <string>
 #include <mutex>
 #include <atomic>
+#include <vector>
 
 namespace minidb {
 
@@ -104,6 +105,21 @@ public:
     //   3. Undo：反向扫描，回滚未提交事务
     //
     void Recover(BufferPoolManager* bpm);
+
+    // ============================================================
+    // WAL 文件截断（Checkpoint 后调用）
+    // ============================================================
+    // 删除 checkpoint_lsn 及之前的所有日志记录，释放磁盘空间。
+    //
+    // 调用时机：
+    //   Checkpoint 完成后（所有脏页已刷盘），调用此方法清理旧日志。
+    //   checkpoint_lsn 之前的日志不再需要用于恢复。
+    //
+    // 【PostgreSQL 对应】
+    //   PG 将 WAL 分成 16MB 的 segment 文件，Checkpoint 后
+    //   通过 pg_archivecleanup 或自动回收旧 segment。
+    //
+    void Truncate(lsn_t checkpoint_lsn);
 
     // 获取当前LSN
     lsn_t GetCurrentLSN() const { return current_lsn_.load(); }
