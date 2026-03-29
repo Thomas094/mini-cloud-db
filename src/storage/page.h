@@ -10,6 +10,24 @@
 namespace minidb {
 
 // ============================================================
+// PageHeader - 页面头部结构（嵌入在 data_[] 的前 N 字节）
+// ============================================================
+// 参考 PostgreSQL 的 PageHeaderData 设计：
+// LSN 直接存储在页面数据的头部，随 ReadPage/WritePage 自动持久化。
+// 这样恢复时从磁盘读入页面后，LSN 天然可用，无需额外处理。
+//
+struct PageHeader {
+    lsn_t page_lsn{INVALID_LSN};   // 8 字节 — 最后修改该页的 WAL LSN
+    // 未来可扩展：checksum, flags, pd_lower, pd_upper 等
+};
+
+// 页面头部大小（用户数据从此偏移开始）
+static constexpr size_t PAGE_HEADER_SIZE = sizeof(PageHeader);
+
+// 用户数据区域大小
+static constexpr size_t PAGE_USER_DATA_SIZE = PAGE_SIZE - PAGE_HEADER_SIZE;
+
+// ============================================================
 // Page - 数据库页面的内存表示
 // ============================================================
 //
@@ -19,7 +37,7 @@ namespace minidb {
 // 一个页面的经典布局：
 //
 // +-------------------+
-// | Page Header       |  ← 包含 LSN、校验和等元数据
+// | Page Header       |  ← 包含 LSN、校验和等元数据（嵌入在 data_ 中）
 // +-------------------+
 // | Line Pointers     |  ← 指向页面内各元组的偏移（Item Pointer Array）
 // | (从前往后增长)     |
@@ -36,9 +54,13 @@ class Page {
 public:
     Page() { Reset(); }
 
-    // 获取页面原始数据指针
+    // 获取页面原始数据指针（包含 PageHeader，用于磁盘 I/O）
     inline char* GetData() { return data_; }
     inline const char* GetData() const { return data_; }
+
+    // 获取用户数据区域指针（跳过 PageHeader，上层业务使用）
+    inline char* GetUserData() { return data_ + PAGE_HEADER_SIZE; }
+    inline const char* GetUserData() const { return data_ + PAGE_HEADER_SIZE; }
 
     // 页面ID（原子变量，允许上层无锁安全读取）
     inline page_id_t GetPageId() const { return page_id_.load(); }
@@ -46,8 +68,14 @@ public:
 
     // LSN —— 这个页面最后一次被修改时的WAL日志位置
     // 恢复时：if (page_lsn < wal_record_lsn) → 需要redo
-    inline lsn_t GetLSN() const { return lsn_; }
-    inline void SetLSN(lsn_t lsn) { lsn_ = lsn; }
+    // 【关键设计】LSN 存储在 data_ 头部的 PageHeader 中，
+    // 随 ReadPage/WritePage 自动持久化到磁盘，无需额外序列化。
+    inline lsn_t GetLSN() const {
+        return reinterpret_cast<const PageHeader*>(data_)->page_lsn;
+    }
+    inline void SetLSN(lsn_t lsn) {
+        reinterpret_cast<PageHeader*>(data_)->page_lsn = lsn;
+    }
 
     // Pin计数：表示有多少线程正在使用这个页面
     // Pin > 0 时不能被 Buffer Pool 淘汰
@@ -93,19 +121,19 @@ public:
     }
 
     // 重置页面
+    // memset 会将 data_ 全部清零，包括 PageHeader 中的 page_lsn，
+    // 因此 LSN 也会被重置为 0（即 INVALID_LSN）。
     void Reset() {
         std::memset(data_, 0, PAGE_SIZE);
         page_id_.store(INVALID_PAGE_ID);
-        lsn_ = INVALID_LSN;
         pin_count_.store(0);
         is_dirty_ = false;
         is_loading_ = false;
     }
 
 private:
-    char data_[PAGE_SIZE]{};           // 页面数据（固定8KB）
+    char data_[PAGE_SIZE]{};           // 页面数据（固定8KB，头部为 PageHeader）
     std::atomic<page_id_t> page_id_{INVALID_PAGE_ID};
-    lsn_t lsn_{INVALID_LSN};
     std::atomic<int> pin_count_{0};
     bool is_dirty_{false};
     bool is_loading_{false};           // 是否正在加载中（类似 PG 的 BM_IO_IN_PROGRESS）

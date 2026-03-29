@@ -68,7 +68,8 @@ Page* BufferPoolManager::FetchPage(page_id_t page_id) {
         page->SetPageId(page_id);
         page->IncrementPinCount();
         page->SetDirty(false);
-        page->SetLSN(0);
+        // LSN 已嵌入 data_ 头部的 PageHeader 中，
+        // ReadPage 读入 data_ 后 LSN 自动恢复，无需手动设置。
     }
     {
         // 加载完成，清除 loading 标记并唤醒等待线程
@@ -152,7 +153,7 @@ Page* BufferPoolManager::NewPage(page_id_t* page_id) {
         page->Reset();
         page->SetPageId(new_page_id);
         page->SetDirty(false);
-        page->SetLSN(0);
+        // Reset() 已将 data_ 全部清零，PageHeader 中的 LSN 也被重置为 0。
         page->IncrementPinCount();
     }
     {
@@ -190,7 +191,8 @@ bool BufferPoolManager::FlushPage(page_id_t page_id) {
         }
         disk_manager_->WritePage(page->GetPageId(), page->GetData());
         page->SetDirty(false);
-        page->SetLSN(page->GetLSN() + 1);
+        // LSN 由 WAL 模块在修改页面时设置，FlushPage 只负责刷盘，
+        // 不应修改 LSN（LSN 已嵌入 data_ 中，会随 WritePage 一起持久化）。
     }
     return true;
 }

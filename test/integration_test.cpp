@@ -3,6 +3,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <unistd.h>
 
 // 引入所有模块
 #include "common/types.h"
@@ -129,7 +130,7 @@ bool TestBufferPoolManager() {
 
         // 写入数据
         const char* data = "BufferPool Test";
-        std::memcpy(page->GetData(), data, strlen(data));
+        std::memcpy(page->GetUserData(), data, strlen(data));
 
         // Unpin 并标记为脏
         EXPECT_TRUE(bpm.UnpinPage(pid, true));
@@ -137,7 +138,7 @@ bool TestBufferPoolManager() {
         // 重新 Fetch
         Page* page2 = bpm.FetchPage(pid);
         EXPECT_TRUE(page2 != nullptr);
-        EXPECT_TRUE(std::memcmp(page2->GetData(), data, strlen(data)) == 0);
+        EXPECT_TRUE(std::memcmp(page2->GetUserData(), data, strlen(data)) == 0);
 
         bpm.UnpinPage(pid, false);
 
@@ -145,6 +146,154 @@ bool TestBufferPoolManager() {
         return true;
     } catch (const std::exception& e) {
         TEST_FAIL("Buffer Pool Manager", e.what());
+        return false;
+    }
+}
+
+// ============================================================
+// 测试3.5：WAL Manager
+// ============================================================
+bool TestWALManager() {
+    TEST_BEGIN("WAL Manager");
+
+    try {
+        const std::string wal_file = "/tmp/test_minidb_wal.log";
+        const std::string db_file = "/tmp/test_minidb_wal_bpm.db";
+
+        // 清理旧文件
+        unlink(wal_file.c_str());
+        unlink(db_file.c_str());
+
+        // ---- 测试1：AppendLog 返回单调递增的 LSN ----
+        {
+            WALManager wal(wal_file);
+            LogRecord rec1 = LogRecord::MakeTxnRecord(LogRecordType::TXN_BEGIN, 1, INVALID_LSN);
+            lsn_t lsn1 = wal.AppendLog(rec1);
+            EXPECT_EQ(lsn1, 1u);
+
+            LogRecord rec2 = LogRecord::MakeTxnRecord(LogRecordType::TXN_BEGIN, 2, INVALID_LSN);
+            lsn_t lsn2 = wal.AppendLog(rec2);
+            EXPECT_EQ(lsn2, 2u);
+
+            EXPECT_TRUE(lsn2 > lsn1);
+
+            // ---- 测试2：Flush 后 flushed_lsn 更新 ----
+            wal.Flush();
+            EXPECT_EQ(wal.GetFlushedLSN(), wal.GetCurrentLSN());
+        }
+
+        // 清理，重新开始完整的 Recover 测试
+        unlink(wal_file.c_str());
+        unlink(db_file.c_str());
+
+        // ---- 测试3：Recover Redo 正确性 ----
+        {
+            // 写入 WAL 日志：模拟事务1写入数据并提交
+            WALManager wal(wal_file);
+
+            // 事务1 BEGIN
+            LogRecord begin_rec = LogRecord::MakeTxnRecord(
+                LogRecordType::TXN_BEGIN, /*txn_id=*/1, INVALID_LSN);
+            lsn_t lsn1 = wal.AppendLog(begin_rec);
+
+            // 事务1 INSERT：向 page 0, offset 0 写入 "Hello"
+            const char* insert_data = "Hello";
+            LogRecord insert_rec = LogRecord::MakeDataRecord(
+                LogRecordType::INSERT, /*txn_id=*/1, /*prev_lsn=*/lsn1,
+                /*page_id=*/0, /*offset=*/0,
+                /*old_data=*/nullptr, /*old_len=*/0,
+                /*new_data=*/insert_data, /*new_len=*/5);
+            lsn_t lsn2 = wal.AppendLog(insert_rec);
+
+            // 事务1 COMMIT
+            LogRecord commit_rec = LogRecord::MakeTxnRecord(
+                LogRecordType::TXN_COMMIT, /*txn_id=*/1, /*prev_lsn=*/lsn2);
+            wal.AppendLog(commit_rec);
+
+            wal.Flush();
+        }
+
+        // 用新的 BPM 进行 Recover，验证 Redo 结果
+        {
+            auto dm = std::make_unique<DiskManager>(db_file);
+            BufferPoolManager bpm(10, dm.get());
+
+            // 先创建 page 0（Recover 需要 FetchPage 能找到它）
+            page_id_t pid;
+            Page* page = bpm.NewPage(&pid);
+            EXPECT_TRUE(page != nullptr);
+            EXPECT_EQ(pid, 0);
+            bpm.UnpinPage(pid, false);
+
+            // 执行 Recover
+            WALManager wal(wal_file);
+            wal.Recover(&bpm);
+
+            // 验证 page 0 的数据被正确 Redo
+            Page* recovered_page = bpm.FetchPage(0);
+            EXPECT_TRUE(recovered_page != nullptr);
+            EXPECT_TRUE(std::memcmp(recovered_page->GetUserData(), "Hello", 5) == 0);
+            bpm.UnpinPage(0, false);
+        }
+
+        // 清理，测试 Undo
+        unlink(wal_file.c_str());
+        unlink(db_file.c_str());
+
+        // ---- 测试4：Recover Undo（未提交事务回滚） ----
+        {
+            WALManager wal(wal_file);
+
+            // 事务2 BEGIN
+            LogRecord begin_rec = LogRecord::MakeTxnRecord(
+                LogRecordType::TXN_BEGIN, /*txn_id=*/2, INVALID_LSN);
+            lsn_t lsn1 = wal.AppendLog(begin_rec);
+
+            // 事务2 UPDATE：向 page 0, offset 0 写入 "World"（旧数据为全零）
+            char old_data[5] = {0};
+            const char* new_data = "World";
+            LogRecord update_rec = LogRecord::MakeDataRecord(
+                LogRecordType::UPDATE, /*txn_id=*/2, /*prev_lsn=*/lsn1,
+                /*page_id=*/0, /*offset=*/0,
+                /*old_data=*/old_data, /*old_len=*/5,
+                /*new_data=*/new_data, /*new_len=*/5);
+            wal.AppendLog(update_rec);
+
+            // 注意：事务2 没有 COMMIT 也没有 ABORT（模拟崩溃）
+            wal.Flush();
+        }
+
+        // Recover 应该 Undo 事务2 的修改
+        {
+            auto dm = std::make_unique<DiskManager>(db_file);
+            BufferPoolManager bpm(10, dm.get());
+
+            // 创建 page 0
+            page_id_t pid;
+            Page* page = bpm.NewPage(&pid);
+            EXPECT_TRUE(page != nullptr);
+            bpm.UnpinPage(pid, false);
+
+            // 执行 Recover
+            WALManager wal(wal_file);
+            wal.Recover(&bpm);
+
+            // 验证 page 0 的数据被 Undo 回旧值（全零）
+            Page* recovered_page = bpm.FetchPage(0);
+            EXPECT_TRUE(recovered_page != nullptr);
+            char expected[5] = {0};
+            EXPECT_TRUE(std::memcmp(recovered_page->GetUserData(), expected, 5) == 0);
+            bpm.UnpinPage(0, false);
+        }
+
+        // 清理临时文件
+        unlink(wal_file.c_str());
+        unlink(db_file.c_str());
+
+        TEST_PASS("WAL Manager");
+        return true;
+    } catch (const std::exception& e) {
+        TEST_FAIL("WAL Manager", e.what());
         return false;
     }
 }
@@ -335,6 +484,7 @@ int main() {
     run("DiskManager", TestDiskManager);
     run("LRUReplacer", TestLRUReplacer);
     run("BufferPoolManager", TestBufferPoolManager);
+    run("WALManager", TestWALManager);
     run("MVCC", TestMVCC);
     run("BPlusTree", TestBPlusTree);
     run("DistributedTxn", TestDistributedTxn);

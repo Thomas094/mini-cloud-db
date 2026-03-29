@@ -9,6 +9,9 @@
 
 namespace minidb {
 
+// 前向声明，Recover() 需要使用 BufferPoolManager
+class BufferPoolManager;
+
 // ============================================================
 // WALManager - WAL 日志管理器
 // ============================================================
@@ -100,7 +103,7 @@ public:
     //   2. Redo：前向扫描，重放所有操作
     //   3. Undo：反向扫描，回滚未提交事务
     //
-    void Recover();
+    void Recover(BufferPoolManager* bpm);
 
     // 获取当前LSN
     lsn_t GetCurrentLSN() const { return current_lsn_.load(); }
@@ -121,6 +124,9 @@ private:
     size_t buffer_offset_{0};          // 当前缓冲区写入位置
 
     std::mutex wal_mutex_;
+
+    // 内部无锁版本的 Flush，供 AppendLog 在已持有锁时调用，避免死锁
+    void FlushInternal();
 };
 
 } // namespace minidb
