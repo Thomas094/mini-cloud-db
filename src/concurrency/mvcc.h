@@ -1,17 +1,23 @@
 #pragma once
 
 #include "common/types.h"
+#include "concurrency/commit_log.h"
+#include "concurrency/tuple_header.h"
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 namespace minidb {
 
+// 前向声明
+class BufferPoolManager;
+
 // ============================================================
-// Tuple 版本头（MVCC 的核心数据结构）
+// Tuple 版本头（MVCC 的核心数据结构 — 内存版本）
 // ============================================================
 //
 // 【面试核心知识点 - MVCC 多版本并发控制】
@@ -34,6 +40,12 @@ namespace minidb {
 //   - PG: 旧版本存在原表中（需要 VACUUM 清理）
 //   - InnoDB: 旧版本存在 Undo Log 中（不需要 VACUUM，但 Undo 可能膨胀）
 //
+// 【持久化说明】
+//   TupleVersion 是内存中的版本链节点。
+//   持久化到磁盘时，xmin/xmax/flags 通过 TupleHeader 嵌入页面数据，
+//   事务状态通过 CommitLog (CLOG) 独立持久化。
+//   版本链指针 (prev_version) 不持久化，重启后通过页面扫描重建。
+//
 
 struct TupleVersion {
     txn_id_t xmin{INVALID_TXN_ID};    // 创建此版本的事务ID
@@ -51,9 +63,9 @@ struct TupleVersion {
     char data[MAX_TUPLE_SIZE]{};
     uint16_t data_len{0};
 
-    // 记录所在页面（用于定位）
+    // 记录所在页面（用于定位磁盘上的持久化位置）
     page_id_t page_id{INVALID_PAGE_ID};
-    uint16_t slot_offset{0};
+    uint16_t slot_id{0};  // 页面内的 slot 编号（对应 TuplePage 中的 slot）
 };
 
 // ============================================================
@@ -94,9 +106,40 @@ struct Snapshot {
 // ============================================================
 // MVCCManager - MVCC 管理器
 // ============================================================
+//
+// 【持久化架构】
+//
+//   MVCCManager
+//     ├── CommitLog (CLOG)     → 事务状态持久化（pg_xact/）
+//     ├── TuplePage            → 元组头部嵌入页面（xmin/xmax/flags）
+//     └── BufferPoolManager    → 页面读写（通过 DiskManager 持久化）
+//
+//   可见性判断流程：
+//     1. 从页面读取 TupleHeader（xmin/xmax/flags）
+//     2. 检查 hint bits（flags）是否已缓存事务状态
+//     3. 如果没有 hint bits → 查询 CLOG 获取事务状态
+//     4. 将 CLOG 查询结果写回 hint bits（良性脏页）
+//     5. 结合 Snapshot 判断可见性
+//
+//   崩溃恢复流程：
+//     1. WAL Redo → 恢复数据页（包含 TupleHeader 中的 xmin/xmax）
+//     2. CLOG 恢复 → 从 WAL 重建事务状态（如果 CLOG 损坏）
+//     3. 重建 next_txn_id_ → 从 CLOG/WAL 中扫描最大 txn_id
+//     4. active_txns_ 为空 → 崩溃后所有事务要么已提交要么已回滚
+//
 class MVCCManager {
 public:
+    // ============================================================
+    // 构造函数
+    // ============================================================
+    // 无 CLOG 版本（纯内存，用于基础测试）
     MVCCManager();
+
+    // 带 CLOG 版本（支持持久化）
+    // clog_file: CLOG 文件路径
+    // bpm: BufferPoolManager 指针（用于读写数据页中的元组）
+    explicit MVCCManager(const std::string& clog_file, BufferPoolManager* bpm = nullptr);
+
     ~MVCCManager() = default;
 
     // ============================================================
@@ -112,7 +155,8 @@ public:
     //      - snapshot.xmax = next_txn_id_（下一个将分配的ID）
     //      - snapshot.active_txns = active_txns_ 的拷贝
     //   4. 存储快照（用于后续可见性判断）
-    //   5. 返回事务ID
+    //   5. 如果有 CLOG → 设置事务状态为 IN_PROGRESS
+    //   6. 返回事务ID
     //
     txn_id_t BeginTransaction();
 
@@ -121,6 +165,12 @@ public:
     // ============================================================
     // 标记事务为已提交，从活跃列表移除
     //
+    // 持久化步骤（如果有 CLOG）：
+    //   1. 先写 WAL（TXN_COMMIT 记录）— 由上层调用者负责
+    //   2. 设置 CLOG 状态为 COMMITTED
+    //   3. CLOG Flush（确保持久化）
+    //   4. 从 active_txns_ 移除
+    //
     void CommitTransaction(txn_id_t txn_id);
 
     // ============================================================
@@ -128,10 +178,15 @@ public:
     // ============================================================
     // 标记事务为已回滚，清理该事务创建的所有版本
     //
+    // 持久化步骤（如果有 CLOG）：
+    //   1. 设置 CLOG 状态为 ABORTED
+    //   2. CLOG Flush
+    //   3. 从 active_txns_ 移除
+    //
     void AbortTransaction(txn_id_t txn_id);
 
     // ============================================================
-    // TODO: 你来实现 - 判断元组版本对事务是否可见
+    // TODO: 你来实现 - 判断元组版本对事务是否可见（内存版本链）
     // ============================================================
     // 这是 MVCC 的核心！面试必问！
     //
@@ -147,22 +202,78 @@ public:
     //
     bool IsVersionVisible(const TupleVersion& version, txn_id_t reader_txn_id) const;
 
+    // ============================================================
+    // TODO: 你来实现 - 判断页面上的元组对事务是否可见（磁盘版本）
+    // ============================================================
+    //
+    // 这是持久化版本的可见性判断，直接从页面读取 TupleHeader。
+    //
+    // 实现步骤：
+    //   1. 从页面读取 TupleHeader（通过 TuplePage::GetTupleHeader）
+    //   2. 检查 hint bits：
+    //      - 如果 XMIN_COMMITTED 已设置 → 跳过 CLOG 查询
+    //      - 如果 XMIN_ABORTED 已设置 → 直接返回不可见
+    //   3. 如果没有 hint bits → 查询 CLOG
+    //      - 查到后设置 hint bits（通过 TuplePage::UpdateHintBits）
+    //   4. 结合 Snapshot 判断可见性（逻辑同 IsVersionVisible）
+    //
+    // 参数：
+    //   page        - 元组所在页面
+    //   slot_id     - 元组的 slot 编号
+    //   reader_txn_id - 读取者的事务 ID
+    //
+    // 返回：元组是否对 reader_txn_id 可见
+    //
+    bool IsTupleVisible(Page* page, uint16_t slot_id, txn_id_t reader_txn_id) const;
+
+    // ============================================================
     // 获取事务的快照
+    // ============================================================
     const Snapshot* GetSnapshot(txn_id_t txn_id) const;
 
+    // ============================================================
+    // 获取 CommitLog（供外部查询事务状态）
+    // ============================================================
+    CommitLog* GetCommitLog() { return clog_.get(); }
+    const CommitLog* GetCommitLog() const { return clog_.get(); }
+
+    // ============================================================
+    // 获取事务状态（优先查内存，fallback 到 CLOG）
+    // ============================================================
+    //
+    // 查询顺序：
+    //   1. 先查内存中的 txn_states_（快速路径）
+    //   2. 如果内存中没有且有 CLOG → 查 CLOG
+    //   3. 都没有 → 返回 INVALID
+    //
+    TxnState GetTransactionState(txn_id_t txn_id) const;
 private:
+    // 内部无锁版本（调用者已持有 mvcc_mutex_）
+    TxnState GetTransactionStateUnlocked(txn_id_t txn_id) const;
+    const Snapshot* GetSnapshotUnlocked(txn_id_t txn_id) const;
+
     std::atomic<txn_id_t> next_txn_id_{1};
 
-    // 活跃事务集合
-    std::unordered_set<txn_id_t> active_txns_;
+    // 活跃事务集合（使用 std::set 保证有序，xmin 取 begin() 即为最小值）
+    std::set<txn_id_t> active_txns_;
 
     // 事务ID → 快照
     std::unordered_map<txn_id_t, Snapshot> txn_snapshots_;
 
-    // 事务ID → 状态
+    // 事务ID → 状态（内存缓存，CLOG 是持久化版本）
     std::unordered_map<txn_id_t, TxnState> txn_states_;
 
     mutable std::mutex mvcc_mutex_;
+
+    // ============================================================
+    // 持久化组件
+    // ============================================================
+
+    // CommitLog — 事务状态持久化（可选，nullptr 表示纯内存模式）
+    std::unique_ptr<CommitLog> clog_;
+
+    // BufferPoolManager — 用于读写数据页中的元组（可选）
+    BufferPoolManager* bpm_{nullptr};
 };
 
 } // namespace minidb
