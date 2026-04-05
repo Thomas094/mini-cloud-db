@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Raft 协议过程可视化演示</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f7f6; display: flex; flex-direction: column; align-items: center; padding: 20px; }
+        h1 { color: #2c3e50; }
+        .controls { margin-bottom: 20px; }
+        .node-container { display: flex; justify-content: center; gap: 20px; flex-wrap: wrap; }
+        
+        .node {
+            width: 150px; height: 180px; border-radius: 12px; background: white;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1); display: flex; flex-direction: column;
+            align-items: center; justify-content: center; position: relative;
+            transition: all 0.3s ease; border: 4px solid #bdc3c7;
+        }
+
+        /* 状态颜色 */
+        .follower { border-color: #95a5a6; }
+        .candidate { border-color: #f1c40f; background: #fef9e7; }
+        .leader { border-color: #2ecc71; background: #eafaf1; box-shadow: 0 0 20px rgba(46, 204, 113, 0.4); }
+        .down { border-color: #e74c3c; opacity: 0.5; background: #fdeaea; }
+
+        .role-label { font-weight: bold; margin-bottom: 10px; font-size: 1.1em; }
+        .term { font-size: 0.9em; color: #7f8c8d; }
+        
+        .timer-bar {
+            width: 80%; height: 8px; background: #eee; border-radius: 4px;
+            margin-top: 15px; overflow: hidden;
+        }
+        .timer-fill { height: 100%; background: #3498db; width: 100%; transition: width 0.1s linear; }
+        
+        .status-msg { margin-top: 20px; padding: 15px; background: #34495e; color: white; border-radius: 8px; min-width: 400px; text-align: center; }
+        button { padding: 8px 16px; cursor: pointer; background: #3498db; color: white; border: none; border-radius: 4px; }
+        button:hover { background: #2980b9; }
+    </style>
+</head>
+<body>
+
+    <h1>Raft 选举过程模拟</h1>
+    
+    <div class="controls">
+        <button onclick="resetSim()">重置集群</button>
+        <span style="margin-left: 20px; color: #666;">提示：当 Leader 停止发送“心跳”时，Follower 会超时并触发新一轮选举。</span>
+    </div>
+
+    <div class="node-container" id="cluster"></div>
+
+    <div class="status-msg" id="log">系统就绪：所有节点初始为 Follower 状态。</div>
+
+    <script>
+        const NODE_COUNT = 5;
+        let nodes = [];
+        let currentTerm = 0;
+
+        class RaftNode {
+            constructor(id) {
+                this.id = id;
+                this.role = 'follower'; // follower, candidate, leader, down
+                this.term = 0;
+                this.timeout = this.getRandomTimeout();
+                this.timeLeft = this.timeout;
+                this.votesReceived = 0;
+                this.initUI();
+            }
+
+            getRandomTimeout() {
+                return 150 + Math.random() * 150; // 模拟 Raft 的随机超时 (150ms - 300ms 放大版)
+            }
+
+            initUI() {
+                const el = document.createElement('div');
+                el.id = `node-${this.id}`;
+                el.className = `node follower`;
+                el.innerHTML = `
+                    <div class="role-label">Node ${this.id}</div>
+                    <div class="term">任期: 0</div>
+                    <div class="timer-bar"><div class="timer-fill" id="timer-${this.id}"></div></div>
+                    <div style="margin-top:10px"><button onclick="toggleNode(${this.id})">宕机/恢复</button></div>
+                `;
+                document.getElementById('cluster').appendChild(el);
+                this.el = el;
+            }
+
+            updateUI() {
+                this.el.className = `node ${this.role}`;
+                this.el.querySelector('.role-label').innerText = `${this.id} : ${this.role.toUpperCase()}`;
+                this.el.querySelector('.term').innerText = `任期: ${this.term}`;
+                const fill = document.getElementById(`timer-${this.id}`);
+                const percent = (this.timeLeft / this.timeout) * 100;
+                fill.style.width = `${Math.max(0, percent)}%`;
+                fill.style.background = this.role === 'leader' ? '#2ecc71' : '#3498db';
+            }
+
+            tick() {
+                if (this.role === 'down') return;
+
+                if (this.role === 'leader') {
+                    // Leader 发送心跳，重置所有其他活着的 Follower 的计时器
+                    this.sendHeartbeat();
+                    this.timeLeft = this.timeout; // Leader 自身计时器固定
+                } else {
+                    this.timeLeft -= 1;
+                    if (this.timeLeft <= 0) {
+                        this.startElection();
+                    }
+                }
+                this.updateUI();
+            }
+
+            startElection() {
+                this.role = 'candidate';
+                this.term += 1;
+                currentTerm = Math.max(currentTerm, this.term);
+                this.timeLeft = this.getRandomTimeout();
+                this.votesReceived = 1; // 投给自己
+                
+                logMsg(`节点 ${this.id} 超时，开始第 ${this.term} 任期选举`);
+                
+                // 模拟拉票
+                nodes.forEach(node => {
+                    if (node.id !== this.id && node.role !== 'down') {
+                        // 简单逻辑：如果对方 Term 小于自己，就投赞成票
+                        if (node.term < this.term) {
+                            node.term = this.term;
+                            node.timeLeft = node.getRandomTimeout(); // 投票后重置计时
+                            this.votesReceived++;
+                        }
+                    }
+                });
+
+                if (this.votesReceived > NODE_COUNT / 2) {
+                    this.becomeLeader();
+                }
+            }
+
+            becomeLeader() {
+                this.role = 'leader';
+                logMsg(`节点 ${this.id} 获得 ${this.votesReceived} 票，成为 Leader！`);
+                // 强制同步所有节点的 Term
+                nodes.forEach(n => { if(n.role !== 'down') n.term = this.term; });
+            }
+
+            sendHeartbeat() {
+                nodes.forEach(node => {
+                    if (node.id !== this.id && node.role !== 'down') {
+                        node.timeLeft = node.getRandomTimeout(); // 重置 Follower 计时器
+                        node.role = 'follower';
+                        node.term = this.term;
+                    }
+                });
+            }
+        }
+
+        function logMsg(msg) {
+            const log = document.getElementById('log');
+            log.innerText = msg;
+        }
+
+        function toggleNode(id) {
+            const node = nodes.find(n => n.id === id);
+            if (node.role === 'down') {
+                node.role = 'follower';
+                node.timeLeft = node.getRandomTimeout();
+                logMsg(`节点 ${id} 重新上线`);
+            } else {
+                node.role = 'down';
+                logMsg(`节点 ${id} 宕机了！`);
+            }
+        }
+
+        function resetSim() {
+            document.getElementById('cluster').innerHTML = '';
+            nodes = [];
+            for (let i = 1; i <= NODE_COUNT; i++) {
+                nodes.push(new RaftNode(i));
+            }
+        }
+
+        // 初始化
+        resetSim();
+
+        // 主循环
+        setInterval(() => {
+            nodes.forEach(n => n.tick());
+        }, 100);
+    </script>
+</body>
+</html>

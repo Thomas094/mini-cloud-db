@@ -738,7 +738,90 @@ assert(done);
 - [ ] 什么是 Noisy Neighbor？如何做多租户隔离？
 - [ ] 冷热分层的迁移策略如何保证不影响在线业务？
 
+### Raft 共识协议
+- [ ] Raft 和 Paxos 的区别？为什么 Raft 更容易理解？
+- [ ] Raft 的三大核心机制：Leader 选举、日志复制、安全性？
+- [ ] 为什么选举超时需要随机化？Split Vote 是什么？
+- [ ] 选举限制（Election Restriction）如何保证安全性？
+- [ ] Log Matching Property 是什么？如何保证？
+- [ ] Leader 为什么不能提交之前任期的日志？（Figure 8 问题）
+- [ ] 网络分区时 Raft 如何保证一致性？
+- [ ] Raft 集群为什么通常是奇数个节点？
+- [ ] nextIndex 和 matchIndex 的作用？初始化为什么值？
+- [ ] Raft 在 etcd、TiKV、CockroachDB 中的应用？
+
 ---
 
-> 🎯 **最终目标**：所有 `./integration_test` 测试通过，每个面试问题都能结合代码讲出原理。  
+## 📦 模块 11：Raft 共识协议
+
+### 学习目标
+理解分布式一致性协议 Raft 的核心原理，包括 Leader 选举、日志复制、安全性保证，
+以及网络分区、节点故障等异常场景的处理。
+
+### 文件结构
+```
+src/raft/
+├── raft_rpc.h          # RPC 消息定义（RequestVote、AppendEntries）
+├── raft_log.h          # 日志管理接口
+├── raft_log.cpp        # 日志管理实现
+├── raft_node.h         # Raft 节点核心（选举、复制、状态机）
+├── raft_node.cpp       # Raft 节点实现
+├── raft_cluster.h      # 集群模拟器接口
+└── raft_cluster.cpp    # 集群模拟器实现（网络分区、宕机模拟）
+
+test/
+└── raft_test.cpp       # 7 个测试场景
+```
+
+### 学习路径
+
+#### 第一步：理解 Raft 基本概念（阅读 raft_rpc.h）
+1. 理解三种节点角色：Follower、Candidate、Leader
+2. 理解任期号（term）的作用——Raft 的逻辑时钟
+3. 理解日志条目（LogEntry）的结构
+4. 理解两种 RPC：RequestVote 和 AppendEntries
+
+#### 第二步：掌握日志操作（阅读 raft_log.h → 实现 raft_log.cpp）
+1. 理解哨兵条目的设计（简化边界处理）
+2. 实现日志追加、获取、截断
+3. 重点理解 AppendEntries 中的冲突处理逻辑
+4. 运行 TestRaftLog 和 TestLogConflictResolution 验证
+
+#### 第三步：实现 Leader 选举（阅读 raft_node.h → 实现选举部分）
+1. 实现 HandleRequestVote：投票逻辑 + 选举限制
+2. 实现 StartElection：发起选举流程
+3. 实现 BecomeLeader：Leader 初始化
+4. 理解随机化选举超时防止 Split Vote
+5. 运行 TestLeaderElection 验证
+
+#### 第四步：实现日志复制（实现 raft_node.cpp 剩余部分）
+1. 实现 HandleAppendEntries：一致性检查 + 日志追加
+2. 实现 SendHeartbeats：构造请求 + 处理响应
+3. 实现 UpdateCommitIndex：多数派确认 + 提交
+4. 实现 Propose：客户端命令入口
+5. 运行 TestLogReplication 验证
+
+#### 第五步：理解故障处理（通过测试学习）
+1. 运行 TestLeaderFailover：理解 Leader 宕机后的重新选举
+2. 运行 TestNetworkPartition：理解网络分区的处理
+3. 运行 TestFiveNodeFaultTolerance：理解集群容错能力
+4. 尝试修改测试，模拟更多故障场景
+
+### 编译和运行
+```bash
+cd build
+cmake .. && make raft_test
+./raft_test
+```
+
+### 进阶挑战
+- [ ] 实现日志持久化（写入磁盘，重启后恢复）
+- [ ] 实现日志压缩（Snapshot）
+- [ ] 实现成员变更（动态增减节点）
+- [ ] 实现 PreVote 优化（防止网络分区节点扰乱集群）
+- [ ] 将 RPC 模拟替换为真正的网络通信（gRPC/TCP）
+
+---
+
+> 🎯 **最终目标**：所有 `./integration_test` 和 `./raft_test` 测试通过，每个面试问题都能结合代码讲出原理。  
 > 💪 **你已有 6 年 C++ 经验，底层实现对你不是问题。重点放在理解"为什么"而非"怎么写"。**
